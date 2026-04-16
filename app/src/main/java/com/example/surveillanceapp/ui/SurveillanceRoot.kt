@@ -14,11 +14,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -39,10 +45,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.runtime.collectAsState
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.surveillanceapp.dji.DjiMobileSdk
+import com.example.surveillanceapp.ai.DetectorStatus
 import com.example.surveillanceapp.behavior.AlertType
 import com.example.surveillanceapp.ui.connection.ConnectionViewModel
 import com.example.surveillanceapp.ui.live.DetectionOverlayView
@@ -155,12 +163,18 @@ private fun LiveScreen(
     var controlsExpanded by remember {
         mutableStateOf(prefs.getBoolean(KEY_CONTROLS_EXPANDED, false))
     }
+    var debugOverlayExpanded by remember {
+        mutableStateOf(prefs.getBoolean(KEY_DEBUG_OVERLAY_EXPANDED, true))
+    }
     var interactionTick by remember { mutableStateOf(0) }
     LaunchedEffect(sdk.productConnected) {
         if (sdk.productConnected) useCameraDemo = false
     }
     LaunchedEffect(controlsExpanded) {
         prefs.edit().putBoolean(KEY_CONTROLS_EXPANDED, controlsExpanded).apply()
+    }
+    LaunchedEffect(debugOverlayExpanded) {
+        prefs.edit().putBoolean(KEY_DEBUG_OVERLAY_EXPANDED, debugOverlayExpanded).apply()
     }
     // Auto-hide panel in fullscreen after short idle period.
     LaunchedEffect(controlsExpanded, zoneEditorEnabled, interactionTick) {
@@ -288,48 +302,18 @@ private fun LiveScreen(
                     )
                 }
 
-                Column(
+                LiveDebugOverlay(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .padding(12.dp)
-                        .widthIn(max = 200.dp)
-                        .background(Color(0x66000000))
-                        .padding(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Text("Frames: ${stats.received}", color = Color.White, style = MaterialTheme.typography.labelLarge)
-                    Text("${stats.lastWidth}x${stats.lastHeight}", color = Color.White, style = MaterialTheme.typography.labelMedium)
-                    Text("Persons: ${detections.size}", color = Color.White, style = MaterialTheme.typography.labelMedium)
-                    Text("Infer: ${detector.inferenceMs} ms", color = Color.White, style = MaterialTheme.typography.labelSmall)
-                    detector.error?.let { err ->
-                        Text(
-                            "Detector: $err",
-                            color = Color(0xFFFFCDD2),
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                    Text(
-                        "Alerts",
-                        color = Color.White,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    AlertChip(
-                        title = "Loiter",
-                        active = AlertType.Loitering in activeAlertTypes,
-                        color = Color(0xFFFFB300),
-                    )
-                    AlertChip(
-                        title = "Restricted",
-                        active = AlertType.RestrictedAreaIntrusion in activeAlertTypes,
-                        color = Color(0xFFE53935),
-                    )
-                    AlertChip(
-                        title = "Crowd",
-                        active = AlertType.Crowd in activeAlertTypes,
-                        color = Color(0xFF8E24AA),
-                    )
-                }
+                        .padding(8.dp)
+                        .widthIn(max = 158.dp),
+                    expanded = debugOverlayExpanded,
+                    onToggleExpanded = { debugOverlayExpanded = !debugOverlayExpanded },
+                    stats = stats,
+                    detector = detector,
+                    detectionsCount = detections.size,
+                    activeAlertTypes = activeAlertTypes,
+                )
             }
 
             if (preview != null) {
@@ -459,11 +443,151 @@ private fun AlertChip(title: String, active: Boolean, color: Color) {
         text = title,
         modifier = Modifier
             .background(bg)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(horizontal = 5.dp, vertical = 2.dp),
         color = fg,
-        style = MaterialTheme.typography.labelSmall,
+        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, lineHeight = 11.sp),
         fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
     )
 }
 
 private const val KEY_CONTROLS_EXPANDED = "live_controls_expanded"
+private const val KEY_DEBUG_OVERLAY_EXPANDED = "live_debug_overlay_expanded"
+
+@Composable
+private fun LiveDebugOverlay(
+    modifier: Modifier = Modifier,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit,
+    stats: LiveSurveillanceViewModel.FrameStats,
+    detector: DetectorStatus,
+    detectionsCount: Int,
+    activeAlertTypes: Set<AlertType>,
+) {
+    val dense = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, lineHeight = 11.sp)
+    val titleDense = MaterialTheme.typography.labelMedium.copy(fontSize = 11.sp, lineHeight = 13.sp)
+    Column(
+        modifier = modifier
+            .background(Color(0x66000000))
+            .padding(2.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = if (expanded) "Diagnostics" else "Live",
+                color = Color.White,
+                style = titleDense,
+                fontWeight = FontWeight.Bold,
+            )
+            IconButton(
+                onClick = onToggleExpanded,
+                modifier = Modifier.size(32.dp),
+            ) {
+                Icon(
+                    imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = if (expanded) "Collapse diagnostics" else "Expand diagnostics",
+                    tint = Color.White,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+
+        if (expanded) {
+            Column(
+                modifier = Modifier.padding(horizontal = 2.dp, vertical = 1.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text("Frames: ${stats.received}", color = Color.White, style = dense)
+                Text("${stats.lastWidth}x${stats.lastHeight}", color = Color.White, style = dense)
+                Text(
+                    "Anchors>1%: ${detector.rawPersonCandidates}",
+                    color = Color(0xFFB0BEC5),
+                    style = dense,
+                )
+                Text(
+                    "AnyCls>1%: ${detector.rawAnyClassCandidates}",
+                    color = Color(0xFFB0BEC5),
+                    style = dense,
+                )
+                Text(
+                    "Above threshold: ${detector.thresholdPassedCandidates}",
+                    color = Color(0xFFB0BEC5),
+                    style = dense,
+                )
+                Text(
+                    "TopCls: ${detector.strongestClassIndex} (${String.format("%.2f", detector.strongestClassConfidence)})",
+                    color = Color(0xFFB0BEC5),
+                    style = dense,
+                )
+                Text("Infer: ${detector.inferenceMs} ms", color = Color.White, style = dense)
+                val outputSummary = detector.modelOutputShape?.trim().orEmpty()
+                Text(
+                    text = if (outputSummary.isNotEmpty()) {
+                        "Output: $outputSummary"
+                    } else {
+                        "Output: —"
+                    },
+                    color = Color(0xFF90A4AE),
+                    style = dense,
+                    maxLines = 3,
+                )
+                detector.error?.let { err ->
+                    Text(
+                        "Detector: $err",
+                        color = Color(0xFFFFCDD2),
+                        style = dense,
+                    )
+                }
+            }
+        }
+
+        if (expanded) {
+            Spacer(modifier = Modifier.height(2.dp))
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 2.dp, vertical = 1.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text(
+                "Persons",
+                color = Color.White,
+                style = dense,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "$detectionsCount",
+                color = Color(0xFF81C784),
+                style = dense.copy(fontSize = 15.sp, lineHeight = 17.sp),
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "Alerts",
+                color = Color.White,
+                style = dense,
+                fontWeight = FontWeight.Bold,
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                AlertChip(
+                    title = "Loiter",
+                    active = AlertType.Loitering in activeAlertTypes,
+                    color = Color(0xFFFFB300),
+                )
+                AlertChip(
+                    title = "Restricted",
+                    active = AlertType.RestrictedAreaIntrusion in activeAlertTypes,
+                    color = Color(0xFFE53935),
+                )
+                AlertChip(
+                    title = "Crowd",
+                    active = AlertType.Crowd in activeAlertTypes,
+                    color = Color(0xFF8E24AA),
+                )
+            }
+        }
+    }
+}

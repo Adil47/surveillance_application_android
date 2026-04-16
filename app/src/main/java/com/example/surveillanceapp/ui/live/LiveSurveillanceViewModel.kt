@@ -2,6 +2,7 @@ package com.example.surveillanceapp.ui.live
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.util.Log
 import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -19,6 +20,7 @@ import dji.sdk.keyvalue.value.common.ComponentIndexType
 import dji.v5.manager.datacenter.MediaDataCenter
 import dji.v5.manager.interfaces.ICameraStreamManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -62,6 +64,7 @@ class LiveSurveillanceViewModel(app: Application) : AndroidViewModel(app) {
     private val decodeChannel = Channel<RawFrame>(Channel.CONFLATED)
 
     private val statsMutex = Mutex()
+    private val inferenceMutex = Mutex()
     private val _stats = MutableStateFlow(FrameStats())
     val stats: StateFlow<FrameStats> = _stats.asStateFlow()
 
@@ -102,19 +105,14 @@ class LiveSurveillanceViewModel(app: Application) : AndroidViewModel(app) {
     )
     private val crowdDetector = CrowdDetector(threshold = 5)
     private val demoFrameCounter = AtomicLong(0)
+    @Volatile
+    private var lastDetectorInitAttemptMs = 0L
+    @Volatile
+    private var detectorInitJob: Job? = null
 
     init {
-        viewModelScope.launch(Dispatchers.Default) {
-            runCatching {
-                detector = YoloV8TfliteDetector(getApplication())
-                _detectorStatus.value = _detectorStatus.value.copy(ready = true, error = null)
-            }.onFailure { e ->
-                _detectorStatus.value = _detectorStatus.value.copy(
-                    ready = false,
-                    error = e.message ?: "Unable to initialize TFLite detector.",
-                )
-            }
-        }
+        Log.i(TAG, "ViewModel init — scheduling detector init")
+        kickDetectorInitIfNeeded(force = true)
     }
 
     init {
@@ -135,8 +133,19 @@ class LiveSurveillanceViewModel(app: Application) : AndroidViewModel(app) {
 
     fun processDemoFrame(bitmap: Bitmap) {
         _isDemoMode.value = true
-        // Step 7: process every Nth frame to keep latency low on-device.
+        kickDetectorInitIfNeeded()
         val n = demoFrameCounter.incrementAndGet()
+        if (n == 1L || n % 30L == 0L) {
+            Log.i(
+                TAG,
+                "processDemoFrame #$n ${bitmap.width}x${bitmap.height} " +
+                    "mutexLocked=${inferenceMutex.isLocked} detectorReady=${detector != null}",
+            )
+        }
+        if (inferenceMutex.isLocked) {
+            bitmap.recycle()
+            return
+        }
         if (n % DEMO_PROCESS_EVERY_NTH != 0L) {
             bitmap.recycle()
             return
@@ -147,44 +156,132 @@ class LiveSurveillanceViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun processBitmap(bmp: Bitmap) {
-        updateRestrictedZoneForCurrentFrame(bmp.width, bmp.height)
-        val startNs = System.nanoTime()
-        val detectorLocal = detector
-        val detections = if (detectorLocal != null) {
-            runCatching { detectorLocal.detect(bmp) }.getOrDefault(emptyList())
-        } else {
-            emptyList()
-        }
-        val ms = (System.nanoTime() - startNs) / 1_000_000L
-        val nowMs = System.currentTimeMillis()
-        val tracks = tracker.update(detections, nowMs)
-        val alerts = buildList {
-            addAll(loiteringDetector.detect(tracks, nowMs))
-            addAll(restrictedAreaDetector.detect(tracks, nowMs))
-            addAll(crowdDetector.detect(tracks, nowMs))
-        }
+        inferenceMutex.withLock {
+            val demo = _isDemoMode.value
+            updateRestrictedZoneForCurrentFrame(bmp.width, bmp.height)
+            val startNs = System.nanoTime()
+            val detectorLocal = detector
+            if (detectorLocal == null) {
+                val count = frameCounter.incrementAndGet()
+                withContext(Dispatchers.Main.immediate) {
+                    val old = _lastPreviewBitmap.value
+                    _lastPreviewBitmap.value = bmp
+                    old?.recycle()
+                    _detections.value = emptyList()
+                    _stats.value = _stats.value.copy(
+                        received = count,
+                        lastWidth = bmp.width,
+                        lastHeight = bmp.height,
+                    )
+                    _detectorStatus.value = _detectorStatus.value.copy(
+                        ready = false,
+                        error = "Detector initializing…",
+                    )
+                }
+                return
+            }
+            val confThresh = if (demo) DEMO_CONF_THRESHOLD else DRONE_CONF_THRESHOLD
+            var detectError: String? = null
+            val (detections, metrics) = runCatching { detectorLocal.detect(bmp, confThreshold = confThresh) }.getOrElse { e ->
+                Log.e(TAG, "detector.detect() threw", e)
+                detectError = e.message ?: "Detector inference failed"
+                emptyList<DetectionResult>() to YoloV8TfliteDetector.InferenceMetrics(
+                    rawPersonOverLoose = 0,
+                    rawAnyClassOverLoose = 0,
+                    rawPersonOverThreshold = 0,
+                    strongestClassIndex = -1,
+                    strongestClassScore = 0f,
+                    outputShapeLabel = e.message ?: "detect failed",
+                )
+            }
+            val ms = (System.nanoTime() - startNs) / 1_000_000L
+            if (demo && (demoFrameCounter.get() % 30L == 0L || detections.isNotEmpty())) {
+                Log.i(
+                    TAG,
+                    "infer ms=$ms detections=${detections.size} " +
+                        "metrics(loose=${metrics.rawPersonOverLoose}," +
+                        "any=${metrics.rawAnyClassOverLoose}," +
+                        "pass=${metrics.rawPersonOverThreshold}," +
+                        "topCls=${metrics.strongestClassIndex}@${"%.2f".format(metrics.strongestClassScore)}) " +
+                        "err=$detectError",
+                )
+            }
+            val nowMs = System.currentTimeMillis()
+            val tracks = tracker.update(detections, nowMs)
+            val alerts = buildList {
+                addAll(
+                    loiteringDetector.detect(
+                        tracks,
+                        nowMs,
+                        durationMs = if (demo) DEMO_LOITER_MS else DRONE_LOITER_MS,
+                        movementRadiusPx = if (demo) DEMO_LOITER_RADIUS_PX else DRONE_LOITER_RADIUS_PX,
+                    ),
+                )
+                addAll(restrictedAreaDetector.detect(tracks, nowMs))
+                addAll(
+                    crowdDetector.detect(
+                        tracks,
+                        nowMs,
+                        personThreshold = if (demo) DEMO_CROWD_PERSON_THRESHOLD else DRONE_CROWD_PERSON_THRESHOLD,
+                    ),
+                )
+            }
 
-        withContext(Dispatchers.Main.immediate) {
-            val old = _lastPreviewBitmap.value
-            _lastPreviewBitmap.value = bmp
-            old?.recycle()
-            _detections.value = detections
-            val count = frameCounter.incrementAndGet()
-            _stats.value = _stats.value.copy(
-                received = count,
-                lastWidth = bmp.width,
-                lastHeight = bmp.height,
-            )
-            _detectorStatus.value = _detectorStatus.value.copy(
-                inferenceMs = ms,
-                detections = detections.size,
-            )
-            if (alerts.isNotEmpty()) {
-                val merged = (alerts + _alertHistory.value).take(30)
-                _alertHistory.value = merged
-                _activeAlertTypes.value = alerts.map { it.type }.toSet()
-            } else {
-                _activeAlertTypes.value = emptySet()
+            withContext(Dispatchers.Main.immediate) {
+                val old = _lastPreviewBitmap.value
+                _lastPreviewBitmap.value = bmp
+                old?.recycle()
+                _detections.value = detections
+                val count = frameCounter.incrementAndGet()
+                _stats.value = _stats.value.copy(
+                    received = count,
+                    lastWidth = bmp.width,
+                    lastHeight = bmp.height,
+                )
+                val prev = _detectorStatus.value
+                _detectorStatus.value = prev.copy(
+                    inferenceMs = ms,
+                    detections = detections.size,
+                    rawPersonCandidates = metrics.rawPersonOverLoose,
+                    rawAnyClassCandidates = metrics.rawAnyClassOverLoose,
+                    thresholdPassedCandidates = metrics.rawPersonOverThreshold,
+                    strongestClassIndex = metrics.strongestClassIndex,
+                    strongestClassConfidence = metrics.strongestClassScore,
+                    modelOutputShape = metrics.outputShapeLabel.takeIf { s ->
+                        s.isNotBlank() && !s.contains("failed", ignoreCase = true) &&
+                            !s.contains("error", ignoreCase = true)
+                    } ?: prev.modelOutputShape,
+                    error = detectError ?: prev.error,
+                )
+                if (alerts.isNotEmpty()) {
+                    val merged = (alerts + _alertHistory.value).take(30)
+                    _alertHistory.value = merged
+                    _activeAlertTypes.value = alerts.map { it.type }.toSet()
+                } else {
+                    _activeAlertTypes.value = emptySet()
+                }
+            }
+        }
+    }
+
+    private fun kickDetectorInitIfNeeded(force: Boolean = false) {
+        detector?.let { return }
+        if (!force && detectorInitJob?.isActive == true) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastDetectorInitAttemptMs < DETECTOR_RETRY_MS) return
+        lastDetectorInitAttemptMs = now
+        detectorInitJob = viewModelScope.launch(Dispatchers.Default) {
+            runCatching {
+                val newDetector = YoloV8TfliteDetector(getApplication())
+                detector = newDetector
+                _detectorStatus.value = _detectorStatus.value.copy(ready = true, error = null)
+                Log.i(TAG, "Detector ready")
+            }.onFailure { e ->
+                Log.e(TAG, "Detector init FAILED", e)
+                _detectorStatus.value = _detectorStatus.value.copy(
+                    ready = false,
+                    error = e.message ?: "Unable to initialize TFLite detector.",
+                )
             }
         }
     }
@@ -344,8 +441,26 @@ class LiveSurveillanceViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private companion object {
+        private const val TAG = "SurveillanceVM"
         const val DRONE_PROCESS_EVERY_NTH = 2L
-        const val DEMO_PROCESS_EVERY_NTH = 3L
+        // Phone camera is already hard-capped to ~4 FPS at the source, so we do not
+        // drop further frames here. Every arriving frame is processed (subject to the
+        // inferenceMutex which drops frames if a previous inference is still running).
+        const val DEMO_PROCESS_EVERY_NTH = 1L
+
+        // Close-up camera demo: keep sensitivity reasonable but not too aggressive.
+        const val DEMO_CONF_THRESHOLD = 0.30f
+        const val DRONE_CONF_THRESHOLD = 0.40f
+        const val DETECTOR_RETRY_MS = 3_000L
+
+        const val DEMO_LOITER_MS = 5_000L
+        const val DRONE_LOITER_MS = 10_000L
+        const val DEMO_LOITER_RADIUS_PX = 60f
+        const val DRONE_LOITER_RADIUS_PX = 80f
+
+        /** Fire when strictly more than this many tracked persons (e.g. 2 → alert at 3+ people). */
+        const val DEMO_CROWD_PERSON_THRESHOLD = 2
+        const val DRONE_CROWD_PERSON_THRESHOLD = 5
 
         fun defaultZoneNormalized(): List<Pair<Float, Float>> = listOf(
             0.34f to 0.28f,

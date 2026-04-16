@@ -16,7 +16,12 @@ class LoiteringDetector(
 
     private val states = HashMap<Long, AnchorState>()
 
-    fun detect(tracks: List<TrackedPerson>, nowMs: Long): List<AlertEvent> {
+    fun detect(
+        tracks: List<TrackedPerson>,
+        nowMs: Long,
+        durationMs: Long = loiterDurationMs,
+        movementRadiusPx: Float = this.movementRadiusPx,
+    ): List<AlertEvent> {
         val active = tracks.map { it.trackId }.toSet()
         states.keys.retainAll(active)
         val alerts = ArrayList<AlertEvent>()
@@ -33,7 +38,7 @@ class LoiteringDetector(
             }
 
             val stayedMs = nowMs - s.anchorSinceMs
-            if (stayedMs >= loiterDurationMs && nowMs - s.lastAlertMs >= cooldownMs) {
+            if (stayedMs >= durationMs && nowMs - s.lastAlertMs >= cooldownMs) {
                 s.lastAlertMs = nowMs
                 alerts += AlertEvent(
                     type = AlertType.Loitering,
